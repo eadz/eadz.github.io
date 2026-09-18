@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RayMarch</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+  /* Portrait stage: full screen on a phone, a phone-shaped column on a desktop. */
+  #stage {
+    position: fixed; inset: 0; margin: 0 auto;
+    height: 100dvh; max-width: calc(100dvh * 9 / 16);
+  }
+  #lens { width: 100%; height: 100%; transform-origin: 0 0; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+  #veil {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+    background: #000; color: #c7d6eb; font: 12px/1.6 ui-monospace, Menlo, monospace;
+    letter-spacing: 0.35em; text-align: center; transition: opacity 1.2s; z-index: 2;
+  }
+  #veil h1 { font-size: 22px; font-weight: 400; letter-spacing: 0.6em; margin: 0 0 0 0.6em; }
+  #veil p { margin: 0; opacity: 0.6; max-width: 80vw; }
+  #veil.gone { opacity: 0; pointer-events: none; }
+  #status.pulse { animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+</style>
+</head>
+<body>
+<div id="stage"><div id="lens"><canvas id="raymarch" tabindex="0"></canvas></div></div>
+<div id="veil">
+  <h1>RAYMARCH</h1>
+  <p id="status" class="pulse">LOADING</p>
+</div>
+<script type="module">
+  const veil = document.getElementById('veil');
+  const status = document.getElementById('status');
+  const say = (text, pulse = false) => { status.textContent = text; status.classList.toggle('pulse', pulse); };
+
+  // Browsers keep audio suspended until a gesture. Bevy opens its AudioContext at start-up,
+  // so remember every context that gets made and resume them all on the first tap.
+  const contexts = [];
+  for (const name of ['AudioContext', 'webkitAudioContext']) {
+    const Native = window[name];
+    if (!Native) continue;
+    window[name] = class extends Native {
+      constructor(...args) { super(...args); contexts.push(this); }
+    };
+  }
+  const unlockAudio = () => contexts.forEach(c => c.state === 'suspended' && c.resume());
+  for (const type of ['pointerdown', 'touchend', 'keydown']) {
+    window.addEventListener(type, unlockAudio, { passive: true });
+  }
+
+  // The fog is raymarched per pixel, and phones report pixel ratios of 3 and up. The canvas
+  // is always backed at CSS size x devicePixelRatio, so to cap the render at 2x the canvas
+  // is laid out smaller and scaled back up. Pointer offsets are reported in the element's
+  // own untransformed space, so input still lines up.
+  // Opt-in for now (`?maxdpr=2`): it has not been proven on a real phone yet, and the
+  // in-game text is laid out for the unscaled canvas.
+  const maxRatio = Number(new URLSearchParams(location.search).get('maxdpr')) || devicePixelRatio;
+  const zoom = Math.max(1, devicePixelRatio / maxRatio);
+  const lens = document.getElementById('lens');
+  lens.style.width = lens.style.height = `${100 / zoom}%`;
+  lens.style.transform = `scale(${zoom})`;
+
+  // Safari's pinch and double-tap zoom ignore `user-scalable=no`.
+  for (const type of ['gesturestart', 'gesturechange', 'dblclick']) {
+    document.addEventListener(type, e => e.preventDefault(), { passive: false });
+  }
+
+  if (!navigator.gpu) {
+    say(window.isSecureContext
+      ? 'THIS BROWSER HAS NO WEBGPU. TRY SAFARI 26+, CHROME OR EDGE.'
+      : 'WEBGPU NEEDS A SECURE ORIGIN. OPEN THIS PAGE OVER HTTPS OR FROM LOCALHOST.');
+  } else {
+    try {
+      const { default: init } = await import('./raymarch.js');
+      say('TAP TO BEGIN');
+      // `?autostart` skips the tap (kiosks, automated checks); audio then stays silent
+      // until the first touch.
+      if (!new URLSearchParams(location.search).has('autostart')) {
+        await new Promise(resolve => veil.addEventListener('pointerup', resolve, { once: true }));
+      }
+      unlockAudio();
+      say('WAKING THE STRUCTURE', true);
+      // Let the message paint before start-up work blocks the main thread.
+      await new Promise(resolve => setTimeout(resolve, 60));
+      const started = init();
+      const reveal = () => { veil.classList.add('gone'); document.getElementById('raymarch').focus(); };
+      // Bevy hands control back to the browser by throwing; that is not a failure.
+      started.catch(e => { if (!String(e).includes('Using exceptions for control flow')) throw e; });
+      setTimeout(reveal, 1500);
+    } catch (e) {
+      console.error(e);
+      say('FAILED TO START: ' + e);
+    }
+  }
+</script>
+</body>
+</html>
