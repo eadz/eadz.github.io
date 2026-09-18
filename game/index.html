@@ -63,9 +63,10 @@
   // is always backed at CSS size x devicePixelRatio, so to cap the render at 2x the canvas
   // is laid out smaller and scaled back up. Pointer offsets are reported in the element's
   // own untransformed space, so input still lines up.
-  // Opt-in for now (`?maxdpr=2`): it has not been proven on a real phone yet, and the
-  // in-game text is laid out for the unscaled canvas.
-  const maxRatio = Number(new URLSearchParams(location.search).get('maxdpr')) || devicePixelRatio;
+  // The cap is 1.5x on touch devices and 2x elsewhere; `?maxdpr=3` overrides it. Keep this
+  // rule in step with `platform::canvas_zoom`, which corrects UI and drag distances for it.
+  const maxRatio = Number(new URLSearchParams(location.search).get('maxdpr'))
+    || (navigator.maxTouchPoints > 0 ? 1.5 : 2);
   const zoom = Math.max(1, devicePixelRatio / maxRatio);
   const lens = document.getElementById('lens');
   lens.style.width = lens.style.height = `${100 / zoom}%`;

@@ -30,7 +30,8 @@ struct Atmosphere {
     // xy = key light screen position, z = ray strength, w = sky glow strength
     key_light: vec4<f32>,
     key_color: vec4<f32>,
-    // x = 1 for open-air levels, y = height of the city plane, z = city brightness,
+    // x = backdrop (0 none, 1 night city, 2 daylight ice shelf), y = height of the ground
+    // plane, z = ground brightness,
     // w = how far the haze reaches across open sky
     sky: vec4<f32>,
     // xy = screen position of the planet, z = radius in screen heights, w = brightness
@@ -239,6 +240,108 @@ fn exterior_sky(ray: vec3<f32>, uv: vec2<f32>, pixel: vec2<f32>, dims: vec2<f32>
     return color;
 }
 
+// Worley noise: distance to the nearest and second-nearest feature point, plus a cell id.
+fn voronoi(g: vec2<f32>) -> vec3<f32> {
+    let cell = floor(g);
+    var f1 = 8.0;
+    var f2 = 8.0;
+    var id = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let c = cell + vec2(f32(x), f32(y));
+            let rnd = hash22(c);
+            let d = distance(g, c + rnd);
+            if d < f1 {
+                f2 = f1;
+                f1 = d;
+                id = rnd.x;
+            } else if d < f2 {
+                f2 = d;
+            }
+        }
+    }
+    return vec3(f1, f2, id);
+}
+
+// Daylight backdrop: a hazy polar sky, the ghost of the planet, and a frozen sea of floes
+// split by dark leads of open water, glittering where the sun catches it.
+fn ice_shelf_sky(ray: vec3<f32>, uv: vec2<f32>, dims: vec2<f32>, cam: vec3<f32>) -> vec3<f32> {
+    let aspect = dims.x / dims.y;
+    let up = ray.y;
+    let horizon = vec3(0.62, 0.74, 0.88);
+    let to_sun = (atm.key_light.xy - uv) * vec2(aspect, 1.0);
+    let sun_glow = vec3(1.0, 0.94, 0.84) * 0.3 / (1.0 + dot(to_sun, to_sun) * 9.0);
+    var color = mix(horizon, vec3(0.05, 0.13, 0.32), smoothstep(-0.01, 0.10, up)) + sun_glow;
+
+    // The planet is still up there, washed out to a pale limb by the daylight.
+    let rel = (uv - atm.planet.xy) * vec2(aspect, 1.0) / atm.planet.z;
+    let r2 = dot(rel, rel);
+    if r2 < 1.0 {
+        let normal = vec3(rel.x, -rel.y, sqrt(1.0 - r2));
+        let lit = smoothstep(-0.05, 0.4, dot(normal, normalize(vec3(-0.78, 0.5, -0.12))));
+        color += vec3(0.75, 0.85, 1.0) * lit * (0.4 + 0.6 * normal.z) * atm.planet.w
+            * smoothstep(0.0, 0.05, up);
+    }
+
+    if up < -0.002 {
+        let t = (atm.sky.y - cam.y) / ray.y;
+        let p = (cam + ray * t).xz;
+        let pixel_angle = 2.0 / (view.clip_from_view[1][1] * dims.y);
+        let across = t * pixel_angle;
+        let footprint = across / sqrt(max(-ray.y, 0.01));
+
+        // Floes. Leads between them are widened to at least a pixel, then faded out where
+        // the floes themselves go sub-pixel.
+        let scale = 1.0 / 34.0;
+        // Warp the lattice so the floes are ragged plates, not a honeycomb.
+        let warp = vec2(value_noise(vec3(p * 0.013, 11.0)), value_noise(vec3(p * 0.013, 23.0))) - 0.5;
+        let v = voronoi(p * scale + warp * 1.6);
+        let soften = footprint * scale;
+        let lead = (1.0 - smoothstep(0.06, 0.24 + soften * 1.5, v.y - v.x))
+            * (1.0 - smoothstep(0.25, 0.7, soften));
+        // A few wide channels of open water wander through the pack.
+        let wander = value_noise(vec3(p * 0.0021, 7.0));
+        let channel = 1.0 - smoothstep(0.040, 0.075, abs(wander - 0.5));
+        let water = max(channel, lead * 0.9);
+
+        let drift = value_noise(vec3(p * 0.045, 2.0));
+        let ridges = value_noise(vec3(p * 0.19, 4.0));
+        var ice = vec3(0.80, 0.88, 0.97) * (0.70 + 0.30 * v.z) * (0.8 + 0.4 * drift);
+        ice += vec3(0.16) * smoothstep(0.6, 0.85, ridges) * (1.0 - smoothstep(0.5, 2.0, footprint));
+        // Sun glitter: needle-sharp up close, melting into a sheen with distance.
+        let spark = hash22(floor(p * 1.3));
+        let twinkle = 0.5 + 0.5 * sin(atm.counts.x * (2.0 + spark.y * 5.0) + spark.y * 60.0);
+        let near_glitter = step(0.965, spark.x) * twinkle * 9.0 * (1.0 - smoothstep(0.4, 1.4, footprint * 1.3));
+        let far_sheen = 0.22 * smoothstep(0.4, 1.4, footprint * 1.3) * (0.6 + 0.4 * drift);
+        ice += vec3(1.0, 0.97, 0.9) * (near_glitter + far_sheen);
+
+        let fresnel = pow(1.0 + ray.y, 7.0);
+        let sea = mix(vec3(0.030, 0.10, 0.20), vec3(0.34, 0.50, 0.70), fresnel);
+        let ground = mix(ice, sea, water) * atm.sky.z;
+        color = mix(horizon + sun_glow, ground, exp(-t / 5200.0));
+    }
+    return color;
+}
+
+// Snow on the wind, in two screen-space layers that slide with the camera for parallax.
+fn snowfall(pixel: vec2<f32>, cam: vec3<f32>) -> f32 {
+    var snow = 0.0;
+    for (var layer = 0; layer < 2; layer++) {
+        let l = f32(layer);
+        let cell_size = 46.0 + 38.0 * l;
+        let speed = 1.0 + 0.7 * l;
+        let q = pixel + vec2(cam.x * (5.0 + 4.0 * l), -cam.y * (5.0 + 4.0 * l))
+            - atm.counts.x * vec2(26.0, 48.0) * speed;
+        let cell = floor(q / cell_size);
+        let rnd = hash22(cell + 19.0 * l);
+        let sway = sin(atm.counts.x * (0.8 + rnd.y) + rnd.x * 30.0) * 5.0;
+        let at = (cell + 0.2 + 0.6 * rnd) * cell_size + vec2(sway, 0.0);
+        let d = (q - at) / (1.1 + 0.9 * l);
+        snow += exp(-dot(d, d)) * step(0.45, rnd.y) * (0.35 + 0.3 * l);
+    }
+    return snow;
+}
+
 fn view_distance(depth: f32) -> f32 {
     // Infinite reverse-z perspective: depth = near / view_z.
     return view.clip_from_view[3][2] / max(depth, 1e-6);
@@ -268,6 +371,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     var far_reach = 2500.0;
     if depth > 1e-6 {
         t_surface = view_distance(depth) / cos_forward;
+    } else if atm.sky.x > 1.5 {
+        scene = vec4(ice_shelf_sky(ray, in.uv, dims, cam), scene.a);
+        far_reach = atm.sky.w;
     } else if atm.sky.x > 0.5 {
         scene = vec4(exterior_sky(ray, in.uv, in.position.xy, dims, cam), scene.a);
         far_reach = atm.sky.w;
@@ -329,5 +435,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let key_falloff = 1.0 / (1.0 + dot(to_key, to_key) * 2.4);
     let rays = atm.key_color.rgb * (shafts * key_falloff * atm.key_light.z) * (1.0 - transmittance);
 
-    return vec4(scene.rgb * transmittance + inscatter + rays, scene.a);
+    var color = scene.rgb * transmittance + inscatter + rays;
+    if atm.sky.x > 1.5 {
+        color += vec3(0.9, 0.95, 1.0) * snowfall(in.position.xy, cam);
+    }
+    return vec4(color, scene.a);
 }
