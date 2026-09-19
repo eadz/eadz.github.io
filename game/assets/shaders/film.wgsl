@@ -61,6 +61,11 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let response = mix(1.0, 0.4, smoothstep(0.3, 0.9, luma));
     color += (fine * 0.8 + coarse * 0.2) * film.grain * response * (0.35 + luma * 1.6);
 
-    color *= 1.0 - film.fade;
+    // Positive: to black, between levels. Negative: to the white of noon, at the very end.
+    if film.fade >= 0.0 {
+        color *= 1.0 - film.fade;
+    } else {
+        color = mix(color, vec3<f32>(0.90, 0.92, 0.94), -film.fade);
+    }
     return vec4(max(color, vec3(0.0)), 1.0);
 }

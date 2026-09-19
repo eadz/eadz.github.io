@@ -6,19 +6,54 @@
 
 const MAX_LAMPS: u32 = 4u;
 const MAX_OCCLUDERS: u32 = 24u;
+const MAX_WARDENS: u32 = 2u;
+const MAX_BLINDS: u32 = 4u;
+const MAX_BANDS: u32 = 4u;
 const KEY_RAY_SAMPLES: i32 = 28;
+// Light scattered per metre of penumbra mist.
+const VEIL_COLOR: vec3<f32> = vec3<f32>(0.012, 0.018, 0.028);
 
 struct Lamp {
-    // xyz = world position, w = in-scatter intensity
+    // xyz = world position, w = in-scatter intensity. For the sun, xy = its slope instead:
+    // how far its light travels across the gameplay plane per metre towards the lens.
     position: vec4<f32>,
-    // rgb = colour, w = falloff radius
+    // rgb = colour, w = falloff radius. A radius of zero marks the sun: parallel rays.
     color: vec4<f32>,
 }
 
 struct Occluder {
     // xy = centre, zw = half extents
     rect: vec4<f32>,
-    // x = depth, y = lamp index
+    // x = depth, y = lamp index, z = solidity of its shadow on the gameplay plane:
+    // 1 a platform, 0.5 penumbra (solid only where two overlap), 0 erased by a Warden
+    info: vec4<f32>,
+}
+
+// A searchlight on the lens side. Its beam is the pyramid from the emitter through the
+// footprint rectangle on the gameplay plane: the same rectangle the collision rules use.
+struct Warden {
+    // xyz = emitter, w = beam strength
+    emitter: vec4<f32>,
+    // xy = centre of the footprint, zw = half extents
+    footprint: vec4<f32>,
+    // rgb = colour, w = pool strength
+    color: vec4<f32>,
+}
+
+// A slab on the lens side that shades the plane from the Wardens.
+struct Blind {
+    // xy = centre, zw = half extents
+    rect: vec4<f32>,
+    // x = depth (positive)
+    info: vec4<f32>,
+}
+
+// A band of weather: an upright rectangle of air, the same one the collision rules cut the
+// shadow platforms with.
+struct Band {
+    // xy = centre, zw = half extents
+    rect: vec4<f32>,
+    // x = 0 for a hole in the haze, 1 for a squall
     info: vec4<f32>,
 }
 
@@ -40,6 +75,14 @@ struct Atmosphere {
     counts: vec4<f32>,
     lamps: array<Lamp, MAX_LAMPS>,
     occluders: array<Occluder, MAX_OCCLUDERS>,
+    // x = Warden count, y = blind count, z = samples along each beam
+    warden_counts: vec4<f32>,
+    wardens: array<Warden, MAX_WARDENS>,
+    blinds: array<Blind, MAX_BLINDS>,
+    // x = band count, y = 1 when the air away from the bands is clear, z = how much of the
+    // haze is left in clear air, w = density a squall adds
+    weather: vec4<f32>,
+    bands: array<Band, MAX_BANDS>,
 }
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -95,11 +138,16 @@ struct Shadowing {
     // How far the shadow here has condensed towards something solid: zero at the slab,
     // one where the shadow volume meets the gameplay plane and becomes walkable.
     gloom: f32,
+    // Penumbra: a single shadow of the kind that is only solid where two overlap. Drawn as
+    // pale drifting mist, so it reads as a shadow's ghost and never as something to stand on.
+    veil: f32,
 }
 
 fn lamp_shadowing(p: vec3<f32>) -> Shadowing {
     var vis = array<f32, MAX_LAMPS>(1.0, 1.0, 1.0, 1.0);
     var gloom = 0.0;
+    // Penumbrae count half each: one alone is a faint veil, two overlapping are an umbra.
+    var half_gloom = 0.0;
     let count = u32(atm.counts.w);
     for (var i = 0u; i < count; i++) {
         let occ = atm.occluders[i];
@@ -109,17 +157,29 @@ fn lamp_shadowing(p: vec3<f32>) -> Shadowing {
         }
         let li = u32(occ.info.y);
         let lamp = atm.lamps[li].position.xyz;
-        // Project the sample back through the lamp onto the occluder's plane.
-        let s = (depth - lamp.z) / (p.z - lamp.z);
-        let q = lamp.xy + (p.xy - lamp.xy) * s;
+        // Project the sample back onto the occluder's plane: along the sun's parallel rays,
+        // which neither spread nor magnify...
+        var s = 1.0;
+        var q = p.xy - lamp.xy * (p.z - depth);
+        if atm.lamps[li].color.w > 0.0 {
+            // ...or through the lamp.
+            s = (depth - lamp.z) / (p.z - lamp.z);
+            q = lamp.xy + (p.xy - lamp.xy) * s;
+        }
         let inside = occ.rect.zw - abs(q - occ.rect.xy);
-        let penumbra = (0.10 + 0.012 * (p.z - depth)) * s;
+        // Capped, so that a slab a long way off (the vessel) still throws a crisp edge.
+        let penumbra = min(0.10 + 0.012 * (p.z - depth), 0.75) * s;
         let shade = smoothstep(-penumbra, penumbra, min(inside.x, inside.y));
         vis[li] *= 1.0 - shade;
-        let condensed = smoothstep(depth - 4.0, -2.0, p.z) * (1.0 - smoothstep(1.0, 6.0, p.z));
-        gloom = max(gloom, shade * condensed);
+        let condensed = smoothstep(max(depth - 4.0, -60.0), -2.0, p.z) * (1.0 - smoothstep(1.0, 6.0, p.z));
+        let solidity = occ.info.z;
+        let whole = step(0.75, solidity);
+        gloom = max(gloom, shade * condensed * whole);
+        half_gloom += shade * condensed * solidity * (1.0 - whole);
     }
-    return Shadowing(vis, gloom);
+    let umbra = smoothstep(0.62, 0.95, half_gloom);
+    gloom = max(gloom, umbra);
+    return Shadowing(vis, gloom, min(half_gloom, 0.5) * 2.0 * (1.0 - umbra));
 }
 
 fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
@@ -132,6 +192,12 @@ fn lamp_inscatter(p: vec3<f32>, ray: vec3<f32>, vis: array<f32, MAX_LAMPS>) -> v
     let count = u32(atm.counts.z);
     for (var i = 0u; i < count; i++) {
         let lamp = atm.lamps[i];
+        if lamp.color.w <= 0.0 {
+            // The sun: the same light everywhere, brightest looking up its rays.
+            let rays = normalize(vec3(lamp.position.xy, 1.0));
+            light += lamp.color.rgb * (lamp.position.w * henyey_greenstein(dot(rays, -ray), 0.5) * vis[i]);
+            continue;
+        }
         let v = p - lamp.position.xyz;
         let d2 = dot(v, v);
         let dir = v * inverseSqrt(d2);
@@ -141,6 +207,145 @@ fn lamp_inscatter(p: vec3<f32>, ray: vec3<f32>, vis: array<f32, MAX_LAMPS>) -> v
         let cone = smoothstep(0.15, 0.6, dir.z);
         let phase = henyey_greenstein(dot(dir, -ray), 0.62);
         light += lamp.color.rgb * (falloff * cone * phase * vis[i]);
+    }
+    return light;
+}
+
+struct Air {
+    // How much of the ordinary haze is here: one in haze, zero in clear air.
+    haze: f32,
+    // How far inside a squall this is: zero outside, one well inside.
+    squall: f32,
+    // One on the edge of a squall or a hole, falling off either side: the wall of spindrift
+    // that marks exactly where shadows start and stop existing.
+    edge: f32,
+}
+
+// The weather at a point, from the same rectangles the collision rules use. The edges are
+// kept tight (a third of a metre) so that what is drawn is what holds.
+fn air_at(p: vec2<f32>) -> Air {
+    var clear = atm.weather.y;
+    var squall = 0.0;
+    var edge = 0.0;
+    let count = u32(atm.weather.x);
+    for (var i = 0u; i < count; i++) {
+        let band = atm.bands[i];
+        let inside = band.rect.zw - abs(p - band.rect.xy);
+        let d = min(inside.x, inside.y);
+        let within = smoothstep(-0.3, 0.3, d);
+        let is_squall = band.info.x;
+        squall = max(squall, within * is_squall);
+        clear = max(clear, within * (1.0 - is_squall));
+        edge = max(edge, exp(-abs(d) * 0.9));
+    }
+    return Air(max(1.0 - clear, squall), squall, edge);
+}
+
+// Narrows the range of t to where a * t + b <= 0.
+fn clip_range(range: vec2<f32>, a: f32, b: f32) -> vec2<f32> {
+    var r = range;
+    if a > 1e-6 {
+        r.y = min(r.y, -b / a);
+    } else if a < -1e-6 {
+        r.x = max(r.x, -b / a);
+    } else if b > 0.0 {
+        r.y = r.x - 1.0;
+    }
+    return r;
+}
+
+// How far the beams reach behind the gameplay plane before the haze has swallowed them.
+const BEAM_END: f32 = -8.0;
+
+// Is `p` hidden from a light at `emitter` by one of the blinds?
+fn blinded(p: vec3<f32>, emitter: vec3<f32>) -> f32 {
+    var open = 1.0;
+    let count = u32(atm.warden_counts.y);
+    for (var i = 0u; i < count; i++) {
+        let blind = atm.blinds[i];
+        let depth = blind.info.x;
+        if p.z >= depth - 0.25 || depth >= emitter.z {
+            continue;
+        }
+        let s = (emitter.z - depth) / (emitter.z - p.z);
+        let q = emitter.xy + (p.xy - emitter.xy) * s;
+        let inside = blind.rect.zw - abs(q - blind.rect.xy);
+        open *= 1.0 - smoothstep(-0.06, 0.06, min(inside.x, inside.y) );
+    }
+    return open;
+}
+
+// Cold light scattered towards the lens by the Wardens' beams. Each beam is a pyramid, so
+// the stretch of the view ray inside it is found in closed form (six half-spaces), and only
+// that stretch is sampled: crisp edges, a handful of samples, nothing for pixels it misses.
+fn warden_beams(cam: vec3<f32>, ray: vec3<f32>, t_surface: f32, jitter: f32) -> vec3<f32> {
+    var light = vec3(0.0);
+    let count = u32(atm.warden_counts.x);
+    let samples = i32(atm.warden_counts.z);
+    for (var w = 0u; w < count; w++) {
+        let warden = atm.wardens[w];
+        let e = warden.emitter.xyz;
+        let c = warden.footprint.xy;
+        let h = warden.footprint.zw;
+        let reach = e.z - cam.z;
+        var range = vec2(0.0, t_surface);
+        // Between the emitter and where the beam dies away behind the plane.
+        range = clip_range(range, ray.z, cam.z - e.z + 1.5);
+        range = clip_range(range, -ray.z, BEAM_END - cam.z);
+        // Inside the four faces of the pyramid.
+        for (var axis = 0; axis < 2; axis++) {
+            let lean = (c[axis] - e[axis]);
+            let slope = ray[axis] * e.z + lean * ray.z;
+            let offset = (cam[axis] - e[axis]) * e.z - lean * reach;
+            range = clip_range(range, slope + h[axis] * ray.z, offset - h[axis] * reach);
+            range = clip_range(range, -slope + h[axis] * ray.z, -offset - h[axis] * reach);
+        }
+        let span = range.y - range.x;
+        if span <= 0.0 {
+            continue;
+        }
+        let throw_length = distance(e, vec3(c, 0.0));
+        var sum = 0.0;
+        for (var i = 0; i < samples; i++) {
+            let p = cam + ray * (range.x + (f32(i) + jitter) / f32(samples) * span);
+            let d = distance(p, e) / throw_length;
+            let falloff = min(1.0 / (d * d), 5.0);
+            let fade = smoothstep(BEAM_END, 0.0, p.z);
+            let dust = 0.55 + 0.9 * value_noise(p * vec3(0.16, 0.16, 0.10) + vec3(atm.counts.x * 0.25, atm.counts.x * -0.12, 0.0));
+            sum += falloff * fade * dust * blinded(p, e);
+        }
+        light += warden.color.rgb * (warden.emitter.w * 0.03 * sum * span / f32(samples));
+    }
+    return light;
+}
+
+// The pool: every surface near the gameplay plane whose xy lies inside a footprint (and
+// outside every blind's shade) is washed with the beam's light, whatever it is made of. A
+// black shadow lit from the front is not black any more, and neither is the Shade.
+fn warden_pool(surface: vec3<f32>) -> vec3<f32> {
+    var light = vec3(0.0);
+    if abs(surface.z) > 9.0 {
+        return light;
+    }
+    let count = u32(atm.warden_counts.x);
+    let blinds = u32(atm.warden_counts.y);
+    for (var w = 0u; w < count; w++) {
+        let warden = atm.wardens[w];
+        let inside = warden.footprint.zw - abs(surface.xy - warden.footprint.xy);
+        var wash = smoothstep(0.0, 0.12, min(inside.x, inside.y));
+        if wash <= 0.0 {
+            continue;
+        }
+        let e = warden.emitter.xyz;
+        for (var i = 0u; i < blinds; i++) {
+            let blind = atm.blinds[i];
+            let k = e.z / (e.z - blind.info.x);
+            let centre = e.xy + (blind.rect.xy - e.xy) * k;
+            let shaded = blind.rect.zw * k - abs(surface.xy - centre);
+            wash *= 1.0 - smoothstep(0.0, 0.12, min(shaded.x, shaded.y));
+        }
+        let grain = 0.8 + 0.2 * value_noise(surface * 1.7);
+        light += warden.color.rgb * (warden.color.w * wash * grain);
     }
     return light;
 }
@@ -371,6 +576,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     var far_reach = 2500.0;
     if depth > 1e-6 {
         t_surface = view_distance(depth) / cos_forward;
+        if atm.warden_counts.x > 0.5 {
+            scene = vec4(scene.rgb + warden_pool(cam + ray * t_surface), scene.a);
+        }
     } else if atm.sky.x > 1.5 {
         scene = vec4(ice_shelf_sky(ray, in.uv, dims, cam), scene.a);
         far_reach = atm.sky.w;
@@ -388,6 +596,8 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     var transmittance = 1.0;
     var inscatter = vec3(0.0);
 
+    let weathered = atm.weather.x + atm.weather.y > 0.5;
+
     // Raymarch the playable slab of fog, where the lamps and their shadow volumes live.
     let t_front = (atm.fog_shape.z - cam.z) / ray.z;
     let t_back = min((atm.fog_shape.w - cam.z) / ray.z, t_surface);
@@ -400,11 +610,34 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             let wisps = 0.55 + 0.9 * value_noise(p * vec3(0.06, 0.09, 0.06) + drift * 0.1);
             let shadowing = lamp_shadowing(p);
             // Condensing shadow reads as dark smoke: it soaks up light instead of scattering it.
-            let gloom = shadowing.gloom;
-            let density = height_density(p.y) * wisps + gloom * 0.22;
+            var gloom = shadowing.gloom;
+            var veil = shadowing.veil;
+            var density = height_density(p.y) * wisps;
+            // Snow scatters far more of the light that falls on it than haze does.
+            var snow_lit = 1.0;
+            if weathered {
+                // In clear air there is next to nothing for light or shadow to fall on. Where
+                // there is weather the haze is never so thin that the difference cannot be
+                // seen; a squall is thicker still, and every edge is a wall of spindrift.
+                var air = air_at(p.xy);
+                // The wall is drawn near the gameplay plane only. The lens has a little
+                // perspective, and a wall as deep as the fog would smear sideways across it.
+                air.edge *= 1.0 - smoothstep(6.0, 28.0, -p.z);
+                let body = smoothstep(atm.fog_shape.w, atm.fog_shape.w + 30.0, p.z);
+                density = density * mix(atm.weather.z, 1.0, air.haze)
+                    + atm.weather.w * body * wisps * (max(air.squall, air.haze * 0.3) + air.edge * 1.5);
+                gloom *= air.haze;
+                veil *= air.haze;
+                snow_lit += 1.6 * air.squall + 2.5 * air.edge;
+            }
+            density += gloom * 0.22;
             let step_transmittance = exp(-density * dt);
-            let light = (ambient + lamp_inscatter(p, ray, shadowing.lamps)) * (1.0 - gloom);
+            let light = (ambient + lamp_inscatter(p, ray, shadowing.lamps)) * ((1.0 - gloom) * snow_lit);
             inscatter += transmittance * (1.0 - step_transmittance) * light;
+            if veil > 0.0 {
+                let curl = value_noise(p * vec3(0.30, 0.42, 0.30) + drift * 0.45);
+                inscatter += transmittance * VEIL_COLOR * (veil * (0.35 + curl * curl * 1.3) * dt);
+            }
             transmittance *= step_transmittance;
         }
     }
@@ -436,8 +669,19 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let rays = atm.key_color.rgb * (shafts * key_falloff * atm.key_light.z) * (1.0 - transmittance);
 
     var color = scene.rgb * transmittance + inscatter + rays;
-    if atm.sky.x > 1.5 {
-        color += vec3(0.9, 0.95, 1.0) * snowfall(in.position.xy, cam);
+    if atm.warden_counts.x > 0.5 {
+        color += warden_beams(cam, ray, t_surface, jitter);
+    }
+    // Backdrop 3 is the same daylight as 2 in still, dry air: the summit, above the weather.
+    var snow = select(0.0, 1.0, atm.sky.x > 1.5 && atm.sky.x < 2.5);
+    if weathered {
+        // Judged where the view ray crosses the gameplay plane: the snow comes down hard
+        // inside a squall, and hardly at all in clear air.
+        let air = air_at((cam + ray * (-cam.z / ray.z)).xy);
+        snow = snow * mix(0.15, 1.0, air.haze) + 3.0 * air.squall;
+    }
+    if snow > 0.0 {
+        color += vec3(0.9, 0.95, 1.0) * (snowfall(in.position.xy, cam) * snow);
     }
     return vec4(color, scene.a);
 }

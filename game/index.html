@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>RayMarch</title>
+<title>Until Noon</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -26,7 +26,9 @@
     background: #000; color: #c7d6eb; font: 12px/1.6 ui-monospace, Menlo, monospace;
     letter-spacing: 0.35em; text-align: center; transition: opacity 1.2s; z-index: 2;
   }
-  #veil h1 { font-size: 22px; font-weight: 400; letter-spacing: 0.6em; margin: 0 0 0 0.6em; }
+  /* Sized and spaced to land where the game draws its own title, so the hand-over reads as
+     a dissolve rather than a cut. */
+  #veil h1 { font-size: 26px; font-weight: 400; letter-spacing: 0.55em; margin: 0 0 0 0.55em; }
   #veil p { margin: 0; opacity: 0.6; max-width: 80vw; }
   #veil.gone { opacity: 0; pointer-events: none; }
   #status.pulse { animation: pulse 2.4s ease-in-out infinite; }
@@ -36,7 +38,7 @@
 <body>
 <div id="stage"><div id="lens"><canvas id="raymarch" tabindex="0"></canvas></div></div>
 <div id="veil">
-  <h1>RAYMARCH</h1>
+  <h1>UNTIL NOON</h1>
   <p id="status" class="pulse">LOADING</p>
 </div>
 <script type="module">
@@ -84,13 +86,10 @@
   } else {
     try {
       const { default: init } = await import('./raymarch.js');
-      say('TAP TO BEGIN');
-      // `?autostart` skips the tap (kiosks, automated checks); audio then stays silent
-      // until the first touch.
-      if (!new URLSearchParams(location.search).has('autostart')) {
-        await new Promise(resolve => veil.addEventListener('pointerup', resolve, { once: true }));
-      }
-      unlockAudio();
+      // The game has its own title screen now, so the page does not ask for a tap of its
+      // own: it goes straight in and the title waits there instead. Audio stays suspended
+      // until the first pointer or key event, which is the tap that begins the game.
+      // (`?autostart` tells the game to skip that title as well; see `src/menu.rs`.)
       say('WAKING THE STRUCTURE', true);
       // Let the message paint before start-up work blocks the main thread.
       await new Promise(resolve => setTimeout(resolve, 60));
